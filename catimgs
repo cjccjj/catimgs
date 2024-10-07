@@ -1,9 +1,10 @@
 #!/bin/bash
-#by CJ Zhang
+
 # Usage information
 usage() {
-    echo "Usage: $(basename "$0") [-n num] <path>"
-    echo "   -n: Number of images per row (default is 5), minimum is 1."
+    echo "Usage: $(basename "$0") [-n imgs_per_row] [<path>]"
+    echo "   -n: Number of imgs per row (default is 5), minimum is 1."
+    echo "   <path>: Optional path containing images (default is current path). If omitted, can be provided via standard input."
     exit 1
 }
 
@@ -18,8 +19,174 @@ restore_on_exit() {
     exit 1
 }
 
-# Trap exit signals
+# Trap exit signals to ensure cursor is restored
 trap restore_on_exit EXIT INT TERM
+
+# Function to check for dependencies
+check_dependencies() {
+    if ! command -v catimg &> /dev/null; then
+        echo "catimg not found. Please install catimg to use this script."
+        exit 1
+    fi
+}
+
+# Function to truncate filename
+truncate_name() {
+    local name="$1"
+    local max_len="$2"
+    local base="${name%.*}"
+    local ext=".${name##*.}"
+	
+	if (( ${#name} > max_len )); then
+        local len_base=$(( max_len - ${#ext} - 3 ))  # 3 for '...'
+        if (( len_base > 0 )); then
+            printf "%s...%s" "${base:0:len_base}" "$ext"
+        else
+            # If max_len is too small, truncate the base only
+            printf "%s..." "${base:0:$(( max_len > 3 ? max_len - 3 : max_len ))}"
+        fi
+    else
+        printf "%s" "$name"
+    fi
+}
+
+# Function to get terminal size safely
+get_terminal_size() {
+    local term_lines term_cols
+
+    if [ -t 1 ]; then
+        # Using tput to get terminal size
+        term_lines=$(tput lines)
+        term_cols=$(tput cols)
+    elif [ -e /dev/tty ]; then
+        # Fallback to stty if stdout is not a terminal
+        read -r term_lines term_cols < <(stty size < /dev/tty)
+    else
+        # Default fallback if terminal size can't be determined
+        term_lines=24
+        term_cols=80
+        echo "Warning: Unable to determine terminal size. Using default 24x80." >&2
+    fi
+
+    echo "$term_lines $term_cols"
+}
+
+# Function to collect images from directory or stdin
+collect_images() {
+    local images=()
+
+    if [ "$from_stdin" = true ]; then
+        # Read image filenames from standard input
+        while IFS= read -r img; do
+            # Trim whitespace
+            img="$(echo "$img" | xargs)"
+            # Check if file exists, is a regular file, and has a supported extension
+            if [[ -f "$img" && "$img" =~ \.(png|jpe?g|gif)$ ]]; then
+                images+=("$img")
+            fi
+        done
+    else
+        # Read image filenames from the specified directory
+        while IFS= read -r -d $'\0' file; do
+            images+=("$file")
+        done < <(find "$img_path" -maxdepth 1 -type f \( \
+            -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.gif" \
+        \) -print0 | sort -z)
+    fi
+
+    echo "${images[@]}"
+}
+
+# Function to display images
+display_imgs() {
+    # Get terminal dimensions
+    read -r term_lines term_cols < <(get_terminal_size)
+
+    # Adjust blocks_in_row based on terminal width
+    local block_width=$(( term_cols / blocks_in_row ))
+    if (( block_width < min_block_width )); then
+        blocks_in_row=$(( term_cols / min_block_width ))
+        blocks_in_row=$(( blocks_in_row < 1 ? 1 : blocks_in_row ))
+        block_width=$min_block_width
+    fi
+
+    # Collect images
+    local images=($(collect_images))
+
+    if (( ${#images[@]} == 0 )); then
+        echo "No images found to display."
+        exit 0
+    fi
+
+    # Request cursor position
+    echo -en "\033[6n" > /dev/tty  # Redirect to /dev/tty
+    IFS=';' read -sdR -p '' row col < /dev/tty  # Read from /dev/tty
+    local line_num=${row#*[}
+
+    local blocks_in_curr_row=0
+    local max_height_in_row=0
+    local scroll_back_rows=0
+
+    for img in "${images[@]}"; do
+        [[ -e "$img" ]] || continue
+
+        # Move down to next row if the current row is filled
+        if (( blocks_in_curr_row >= blocks_in_row )); then
+            line_num=$(( line_num + max_height_in_row + 1 ))
+            max_height_in_row=0
+            blocks_in_curr_row=0
+        fi
+
+        # Scroll back line if exceed terminal height
+        line_num=$((line_num - scroll_back_rows))
+        scroll_back_rows=0
+
+        # Calculate starting column for the image
+		local start_col=$(( blocks_in_curr_row * block_width + 1 ))
+
+        # Display the truncated filename
+		local truncated_name
+        truncated_name=$(truncate_name "$(basename "$img")" "$((block_width - 1))")
+        printf "\033[%d;%dH%s\n" "$line_num" "$start_col" "$truncated_name"
+
+        # Render image using catimg and process each line
+        local curr_line=0
+		
+		while IFS= read -r line; do
+			# For animated gif show only first frame and remove timing controls
+			if  [[ "$img" == *.gif ]]; then
+				# Check if the line contains the escape sequence \033[u
+				if grep -q $'\e\[u' <<< "$line"; then
+					break  # Stop processing further lines for this image
+				fi
+
+				# Remove ANSI escape sequences using sed
+				line=$(sed 's/\x1b\[[0-9;]*[HfJsuK]//g' <<< "$line")
+			fi
+			
+			# Print the line at the calculated position
+			printf "\033[%d;%dH%s\n" "$(( line_num + curr_line + 1 ))" "$start_col" "$line"
+
+            ((curr_line++))
+
+        done < <(catimg -l 0 -w $(( block_width * 2 - 1 )) "$img")
+
+        # Scroll back cursor if exceed terminal height
+        if ((( line_num + curr_line ) > term_lines)); then
+            scroll_back_rows=$((line_num + curr_line - term_lines + 1))
+        fi
+
+        # Update max_height_in_row based on the current image's height
+        if (( curr_line > max_height_in_row )); then
+            max_height_in_row=$curr_line
+        fi
+
+        ((blocks_in_curr_row++))
+    done
+}
+
+# Check for dependencies
+check_dependencies
 
 # Parse command line arguments
 while getopts "n:" opt; do
@@ -39,130 +206,26 @@ while getopts "n:" opt; do
 done
 shift $((OPTIND - 1))
 
-# Function to check for catimg
-check_dependencies() {
-    if ! command -v catimg &> /dev/null; then
-        echo "catimg not found. Please install catimg to use this script."
-        exit 1
-    fi
-}
-
-# Validate and set image path
-if [[ -n "$1" ]]; then
-    img_path="$1"
+# Determine if input is coming from a pipe
+from_stdin=false
+if [ -p /dev/stdin ]; then
+    from_stdin=true
 fi
 
-if [[ ! -d "$img_path" ]]; then
-    echo "Error: '$img_path' is not a directory."
-    usage
+# If not reading from stdin, validate and set image path
+if [ "$from_stdin" = false ]; then
+    if [[ -n "$1" ]]; then
+        img_path="$1"
+    fi
+
+    if [[ ! -d "$img_path" ]]; then
+        echo "Error: '$img_path' is not a directory."
+        usage
+    fi
+
+    # Ensure blocks_in_row is at least 1
+    blocks_in_row=$(( blocks_in_row < 1 ? 1 : blocks_in_row ))
 fi
-
-# Ensure blocks_in_row is at least 1
-blocks_in_row=$(( blocks_in_row < 1 ? 1 : blocks_in_row ))
-
-# Function to truncate filename
-truncate_name() {
-    local name="$1"
-    local max_len="$2"
-    local base="${name%.*}"
-    local ext=".${name##*.}"
-
-    if (( ${#name} > max_len )); then
-        local len_base=$(( max_len - ${#ext} - 3 ))  # 3 for '...'
-        if (( len_base > 0 )); then
-            printf "%s...%s" "${base:0:len_base}" "$ext"
-        else
-            # If max_len is too small, truncate the base only
-            printf "%s..." "${base:0:$(( max_len > 3 ? max_len - 3 : max_len ))}"
-        fi
-    else
-        printf "%s" "$name"
-    fi
-}
-
-# Function to display images
-display_imgs() {
-    # Get terminal dimensions
-	local term_cols term_lines
-    read -r term_lines term_cols < <(stty size)
-
-    # Adjust blocks_in_row based on terminal width
-    local block_width=$(( term_cols  / blocks_in_row))
-    if (( block_width < min_block_width )); then
-        blocks_in_row=$(( term_cols / min_block_width))
-        blocks_in_row=$(( blocks_in_row < 1 ? 1 : blocks_in_row ))
-        block_width=$min_block_width
-    fi
-
-    # Collect images with supported extensions
-    mapfile -t images < <(find "$img_path" -maxdepth 1 -type f \( \
-        -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.gif" \
-    \) | sort)
-
-    if (( ${#images[@]} == 0 )); then
-        echo "No images found in the directory."
-        exit 0
-    fi
-
-    clear  # Clear terminal before drawing
-
-    local line_num=1
-    local blocks_in_curr_row=0
-    local max_height_in_row=0
-
-    for img in "${images[@]}"; do
-        [[ -e "$img" ]] || continue
-
-        # Check if the current row is filled
-        if (( blocks_in_curr_row >= blocks_in_row )); then
-            line_num=$(( line_num + max_height_in_row + 1 ))
-
-            # Check if adding the next row exceeds terminal height, assuming same height in next row
-            if (( line_num + max_height_in_row > term_lines )); then
-                echo -ne "\033[${term_lines};0H"
-                read -rp "Press Enter to continue..."
-                clear
-                line_num=1
-            fi
-
-            max_height_in_row=0
-            blocks_in_curr_row=0
-        fi
-
-        local start_col=$(( blocks_in_curr_row * block_width +1 ))
-        local truncated_name
-        truncated_name=$(truncate_name "$(basename "$img")" "$((block_width -1))")
-
-        # Display the truncated filename
-        printf "\033[%d;%dH%s\n" "$line_num" "$start_col" "$truncated_name"
-
-        # Render image using catimg and process each line
-        local curr_line=0
-        while IFS= read -r line; do
-            # check if the line contains the escape sequence \033[u
-			if grep -q $'\e\[u' <<< "$line"; then
-                break  # Stop processing further lines for this image
-            fi
-
-            # Remove ANSI escape sequences using sed
-			clean_line=$(sed 's/\x1b\[[0-9;]*[HfJsuK]//g' <<< "$line")
-
-            # Print the line at the calculated position
-            printf "\033[%d;%dH%s\n" "$(( line_num + curr_line + 1 ))" "$start_col" "$clean_line"
-            ((curr_line++))
-        done < <(catimg -l 0 -w $(( block_width * 2 - 1)) "$img")
-
-        # Update max_height_in_row based on the current image's height
-        if (( curr_line > max_height_in_row )); then
-            max_height_in_row=$curr_line
-        fi
-
-        ((blocks_in_curr_row++))
-    done
-}
-
-# Check for dependencies
-check_dependencies
 
 # Execute
 display_imgs
